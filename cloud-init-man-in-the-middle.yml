@@ -1,0 +1,300 @@
+#cloud-config
+
+package_update: true
+
+packages:
+  - conntrack
+
+write_files:
+  - path: /etc/systemd/system/mitm.service
+    owner: root:root
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=man-in-the-middle service
+      After=network-online.target
+    
+      [Service]
+      User=root
+      Group=root
+      ExecStart=/usr/local/sbin/mitm.sh
+      Restart=always
+      KillSignal=SIGQUIT
+      Type=simple
+    
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /usr/local/sbin/mitm.sh
+    owner: root:root
+    permissions: '0744'
+    content: |
+      #!/bin/bash
+      
+      set -e
+      #set -x
+      
+      declare -A config
+      config[lock_file]="/run/mitm.lock"
+      config[mitm_network_namespace]="mitm"
+      config[default_gateway4]="10.40.1.1"
+      config[mitm_configs]="mitm_service_blue mitm_service_green mitm_oob"
+      
+      declare -A mitm_service_blue
+      mitm_service_blue[upstream_link]="ens6"
+      mitm_service_blue[upstream_vlan_id]="40"
+      mitm_service_blue[downstream_link]="ens5"
+      mitm_service_blue[downstream_vlan_id]="2040"
+      mitm_service_blue[bridge_name]="br-blue"
+      mitm_service_blue[bridge_ipv4]="10.40.1.113/24"
+      mitm_service_blue[bridge_subnet4]="10.40.1.0/24"
+      mitm_service_blue[bridge_gateway4]="10.40.1.1"
+      
+      declare -A mitm_service_green
+      mitm_service_green[upstream_link]="ens6"
+      mitm_service_green[upstream_vlan_id]="35"
+      mitm_service_green[downstream_link]="ens5"
+      mitm_service_green[downstream_vlan_id]="2035"
+      mitm_service_green[bridge_name]="br-green"
+      mitm_service_green[bridge_ipv4]="10.35.1.113/24"
+      mitm_service_green[bridge_subnet4]="10.35.1.0/24"
+      mitm_service_green[bridge_gateway4]="10.35.1.1"
+
+      declare -A mitm_oob
+      mitm_oob[upstream_link]="ens6"
+      mitm_oob[upstream_vlan_id]="20"
+      mitm_oob[downstream_link]="ens5"
+      mitm_oob[downstream_vlan_id]="2020"
+      mitm_oob[bridge_name]="oob"
+      mitm_oob[bridge_ipv4]="10.20.1.113/24"
+      mitm_oob[bridge_subnet4]="10.20.1.0/24"
+      mitm_oob[bridge_gateway4]="10.20.1.1"
+      
+      warn() {
+          logger -e -t "$(basename $0)" -i "$*"
+      }
+      
+      error() {
+          warn $@
+          exit 1
+      }
+      
+      debug() {
+          echo $@ 1>&2
+      }
+      
+      cleanup() {
+          warn "Cleaning up..."
+          local mitm_netns="${config[mitm_network_namespace]}"
+          local netns_pids="$(ip netns pids ${mitm_netns} | tr '\n' ' ')"
+          if [[ -n "${netns_pids}" ]]
+          then
+              warn "Terminating process IDs ${netns_pids}"
+              kill ${netns_pids}
+              wait_for_pids ${netns_pids}
+          fi
+          for mitm_config in ${config[mitm_configs]}
+          do 
+              local upstream_link="${mitm_config}[upstream_link]"
+              local upstream_vlan_id="${mitm_config}[upstream_vlan_id]"
+              local downstream_link="${mitm_config}[downstream_link]"
+              local downstream_vlan_id="${mitm_config}[downstream_vlan_id]"
+              local bridge_name="${mitm_config}[bridge_name]"
+              place_link_in_default_netns "${!upstream_link}"
+              place_link_in_default_netns "${!downstream_link}"
+              delete_vlan_link "${!upstream_link}" "${!upstream_vlan_id}"
+              delete_vlan_link "${!downstream_link}" "${!downstream_vlan_id}"
+              delete_bridge "${!bridge_name}"
+          done
+          delete_netns "${mitm_netns}"
+          rm -f "${config[lock_file]}"
+      }
+      
+      wait_for_pids() {
+          sleep 0.5
+          for pid in $@
+          do
+              while [[ -e "/proc/${pid}" ]]
+              do
+                warn "Killing process ID ${pid}"
+                kill -9 "$pid" || true
+                sleep 0.5
+              done
+          done
+      }
+      
+      create_netns() {
+          warn "Creating network namespace: $1"
+          ip netns add "$1"
+      }
+      
+      delete_netns() {
+          warn "Deleting network namespace: $1"
+          ip netns delete "$1" 2> /dev/null || true
+      }
+      
+      in_netns() {
+          local ns="$1"
+          shift
+          warn "Running in $ns network namespace: $*"
+          ip netns exec "$ns" $@
+      }
+      
+      in_mitm_netns() {
+          local ns="${config[mitm_network_namespace]}"
+          in_netns "$ns" $@
+      }
+      
+      place_link_in_mitm_netns() {
+          local link="$1"
+          warn "Placing link in mitm network namespace: $link"
+          in_mitm_netns ip link show "$link" &> /dev/null || \
+              ip link set $link netns "${config[mitm_network_namespace]}"
+      }
+      
+      place_link_in_default_netns() {
+          local link="$1"
+          warn "Placing link in default network namespace: $link"
+          in_mitm_netns ip link show "$link" &> /dev/null && \
+              in_mitm_netns ip link set "$link" netns 1 || true
+      }
+      
+      enable_link_with_mtu() {
+          local link="$1"
+          local mtu="$2"
+          warn "Enabling link in default network namespace $link with MTU $mtu"
+          in_mitm_netns ip link set "$link" mtu "$mtu" up
+      }
+      
+      disable_ipv6() {
+          in_mitm_netns sysctl -q net.ipv6.conf.all.disable_ipv6=1
+          in_mitm_netns sysctl -q net.ipv6.conf.default.disable_ipv6=1
+          in_mitm_netns sysctl -q net.ipv6.conf.lo.disable_ipv6=0
+      }
+      
+      create_bridge() {
+          local name="$1"
+          warn "Warning: Forwarding all protocols, including those not typically forwarded \
+      by an 802.1D bridge"
+          in_mitm_netns ip link add name "$name" type bridge \
+              stp_state 0 \
+              group_fwd_mask 65528 \
+              vlan_filtering 0 \
+              nf_call_iptables 1 \
+              nf_call_ip6tables 1 \
+              nf_call_arptables 1
+      }
+      
+      delete_bridge() {
+          local name="$1"
+          in_mitm_netns ip link delete "$name"
+      }
+      
+      create_vlan_link() {
+          local parent_link="$1"
+          local vlan_id="$2"
+          in_mitm_netns ip link add link "$parent_link" name "${parent_link}.${vlan_id}" type vlan id "$vlan_id"
+      }
+      
+      delete_vlan_link() {
+          local parent_link="$1"
+          local vlan_id="$2"
+          in_mitm_netns ip link delete "${parent_link}.${vlan_id}"
+      }
+      
+      set_link_master() {
+          local link="$1"
+          local master_link="$2"
+          in_mitm_netns ip link set "$link" master "$master_link"
+      }
+      
+      set_ipv4_on_link() {
+          local ipv4_address="$1"
+          local link="$2"
+          in_mitm_netns ip address add "$ipv4_address" dev "$link"
+      }
+      
+      create_ipv4_route() {
+          local ipv4_prefix="$1"
+          local ipv4_next_hop="$2"
+          local table="${3:-254}"
+          in_mitm_netns ip route add "$ipv4_prefix" via "$ipv4_next_hop" table "$table"
+      }
+      
+      create_ipv4_rule() {
+          local preference="$1"
+          local from_ipv4_prefix="$2"
+          local table="$3"
+          in_mitm_netns ip rule add pref "$preference" from "$from_ipv4_prefix" table "$table"
+      }
+      
+      create_iptables_rules() {
+          local link="$1"
+          in_mitm_netns iptables -t filter -A FORWARD \
+              -i "$link" -o "$link" \
+              -m conntrack --ctstate new \
+              -j ACCEPT
+          in_mitm_netns iptables -t filter -A FORWARD \
+              -i "$link" -o "$link" \
+              -j ACCEPT
+      }
+      
+      init() {
+          warn "Starting up..."
+          trap cleanup EXIT
+          touch "${config[lock_file]}"
+          modprobe br_netfilter
+      }
+      
+      main() {
+          create_netns "${config[mitm_network_namespace]}"
+          local index=0
+          for mitm_config in ${config[mitm_configs]}
+          do 
+              local upstream_link="${mitm_config}[upstream_link]"
+              local upstream_vlan_id="${mitm_config}[upstream_vlan_id]"
+              local downstream_link="${mitm_config}[downstream_link]"
+              local downstream_vlan_id="${mitm_config}[downstream_vlan_id]"
+              local bridge_name="${mitm_config}[bridge_name]"
+              local bridge_ipv4="${mitm_config}[bridge_ipv4]"
+              local bridge_subnet4="${mitm_config}[bridge_subnet4]"
+              local bridge_gateway4="${mitm_config}[bridge_gateway4]"
+              place_link_in_mitm_netns "${!upstream_link}"
+              place_link_in_mitm_netns "${!downstream_link}"
+              enable_link_with_mtu "${!upstream_link}" 9200
+              enable_link_with_mtu "${!downstream_link}" 9200
+              enable_link_with_mtu lo 1500
+              disable_ipv6
+              create_bridge "${!bridge_name}"
+              create_vlan_link "${!upstream_link}" "${!upstream_vlan_id}"
+              create_vlan_link "${!downstream_link}" "${!downstream_vlan_id}"
+              set_link_master "${!downstream_link}.${!downstream_vlan_id}" "${!bridge_name}"
+              set_link_master "${!upstream_link}.${!upstream_vlan_id}" "${!bridge_name}"
+              enable_link_with_mtu "${!bridge_name}" 1500
+              enable_link_with_mtu "${!upstream_link}.${!upstream_vlan_id}" 9200
+              enable_link_with_mtu "${!downstream_link}.${!downstream_vlan_id}" 9200
+              set_ipv4_on_link "${!bridge_ipv4}" "${!bridge_name}"
+              create_ipv4_rule "$(( index + 100 ))" "${!bridge_subnet4}" "$(( $index + 100 ))"
+              create_ipv4_route default "${!bridge_gateway4}" "$(( $index + 100 ))"
+              create_iptables_rules "${!bridge_name}"
+              (( ++index ))
+          done
+          create_ipv4_route default "${config[default_gateway4]}"
+          warn "Waiting for event"
+          sleep infinity
+      }
+      
+      if [[ -f "${config[lock_file]}" ]]
+      then
+          error "Found lock file ${config[lock_file]}.  $(basename $0) might \
+      already be running, remove it if stale.  Exiting..."
+      else
+          init
+          main
+      fi
+
+runcmd:
+  - systemctl daemon-reload
+  - systemctl enable mitm.service
+  - systemctl start mitm.service
+
